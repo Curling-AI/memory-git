@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import fsSync from 'fs';
 import path from 'path';
 import os from 'os';
+import { syncBuiltinESMExports } from 'module';
 import { execSync } from 'child_process';
 import { MemoryGit } from '../src/index';
 
@@ -36,93 +37,155 @@ async function looseObjects(dir: string): Promise<string[]> {
     return out;
 }
 
-function statCallsMatching(spy: { mock: { calls: unknown[][] } }, re: RegExp): unknown[][] {
-    return spy.mock.calls.filter(([p]) => re.test(String(p)));
+/**
+ * Spies on every real-disk stat flavour and returns the paths they were called
+ * with. The library imports `statSync` by name, so the ESM bindings are
+ * re-synced to the spied CommonJS exports.
+ */
+function spyRealStats(): () => string[] {
+    const spies = [
+        vi.spyOn(fsSync, 'statSync'),
+        vi.spyOn(fsSync, 'lstatSync'),
+        vi.spyOn(fsSync.promises, 'stat'),
+        vi.spyOn(fsSync.promises, 'lstat'),
+    ];
+    syncBuiltinESMExports();
+    return () => spies.flatMap(s => s.mock.calls.map(([p]) => String(p)));
 }
+
+const statCallback = (memGit: MemoryGit, p: string): Promise<fsSync.Stats> =>
+    new Promise((resolve, reject) => {
+        memGit.fs.stat(p, (err: unknown, s: fsSync.Stats) => (err ? reject(err) : resolve(s)));
+    });
 
 describe('lazy index of content-addressed git objects', () => {
     let realDir: string;
     let memGit: MemoryGit;
+    let objects: string[];
+    const memPathOf = (rel: string) => path.posix.join(memGit.dir, rel);
 
     beforeEach(async () => {
         realDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mg-lazy-immutable-'));
         await createRealRepo(realDir);
+        objects = await looseObjects(realDir);
         memGit = new MemoryGit('lazy-immutable-test', { lazy: true });
     });
 
     afterEach(async () => {
         vi.restoreAllMocks();
+        syncBuiltinESMExports();
         try { await fs.rm(realDir, { recursive: true, force: true }); } catch { /* ignore */ }
     });
 
     it('loadFromDisk indexes loose objects without stat-ing them', async () => {
-        const objects = await looseObjects(realDir);
-        expect(objects.length).toBeGreaterThan(0);
-        const statSpy = vi.spyOn(fsSync.promises, 'stat');
+        expect(objects.length).toBeGreaterThanOrEqual(4);
+        const statted = spyRealStats();
 
         await memGit.loadFromDisk(realDir);
 
-        expect(statCallsMatching(statSpy, LOOSE_OBJECT_RE)).toEqual([]);
+        expect(statted().filter(p => LOOSE_OBJECT_RE.test(p))).toEqual([]);
         // Working-tree files keep their stat: size and mtime drive change detection.
-        expect(statCallsMatching(statSpy, /\/a\.txt$/).length).toBe(1);
+        expect(statted().filter(p => p.endsWith('/a.txt'))).toHaveLength(1);
         expect(await memGit.fileExists(objects[0])).toBe(true);
     });
 
     it('loadFromDisk indexes pack files without stat-ing them', async () => {
         execSync('git gc -q', { cwd: realDir });
-        const statSpy = vi.spyOn(fsSync.promises, 'stat');
+        const statted = spyRealStats();
 
         await memGit.loadFromDisk(realDir);
 
-        expect(statCallsMatching(statSpy, PACK_RE)).toEqual([]);
+        expect(statted().filter(p => PACK_RE.test(p))).toEqual([]);
         const commits = await memGit.log();
         expect(commits.map(c => c.message.trim())).toEqual(['v2', 'initial']);
     });
 
-    it('stat of an unread object returns its size and mtime from disk, without reading it', async () => {
+    it('type checks on an unread object never touch disk, on every stat surface', async () => {
         await memGit.loadFromDisk(realDir);
-        const [rel] = await looseObjects(realDir);
-        const onDisk = await fs.stat(path.join(realDir, rel));
-        const memPath = path.posix.join(memGit.dir, rel);
+        const statted = spyRealStats();
 
-        const viaSync = memGit.fs.statSync(memPath);
-        const viaPromise = await memGit.fs.promises.lstat(memPath);
-        const viaCallback = await new Promise<fsSync.Stats>((resolve, reject) => {
-            memGit.fs.stat(memPath, (err: unknown, s: fsSync.Stats) => (err ? reject(err) : resolve(s)));
-        });
+        const stats = [
+            memGit.fs.statSync(memPathOf(objects[0])),
+            memGit.fs.lstatSync(memPathOf(objects[1])),
+            await memGit.fs.promises.stat(memPathOf(objects[2])),
+            await statCallback(memGit, memPathOf(objects[3])),
+        ];
 
-        for (const s of [viaSync, viaPromise, viaCallback]) {
-            expect(s.size).toBe(onDisk.size);
-            expect(s.mtimeMs).toBe(onDisk.mtimeMs);
+        for (const s of stats) {
             expect(s.isFile()).toBe(true);
+            expect(s.isDirectory()).toBe(false);
         }
-        const inMemory = memGit.vol.toJSON() as Record<string, string | null>;
-        expect(inMemory[memPath]).toBeUndefined();
+        expect(statted()).toEqual([]);
     });
 
-    it('stat of an unread object that vanished from disk throws ENOENT and forgets it', async () => {
+    it('size and mtime of an unread object come from disk once, on every stat surface', async () => {
         await memGit.loadFromDisk(realDir);
-        const [rel] = await looseObjects(realDir);
-        await fs.rm(path.join(realDir, rel), { force: true });
-        const memPath = path.posix.join(memGit.dir, rel);
+        const statted = spyRealStats();
+        const surfaces = [
+            (p: string) => memGit.fs.statSync(p),
+            (p: string) => memGit.fs.promises.lstat(p),
+            (p: string) => statCallback(memGit, p),
+        ];
 
-        let code: string | undefined;
-        try {
-            memGit.fs.statSync(memPath);
-        } catch (err) {
-            code = (err as NodeJS.ErrnoException).code;
+        for (const [i, statFn] of surfaces.entries()) {
+            const rel = objects[i];
+            const onDisk = await fs.stat(path.join(realDir, rel));
+            const before = statted().length;
+
+            const s = await statFn(memPathOf(rel));
+            expect(s.size).toBe(onDisk.size);
+            expect(s.mtimeMs).toBe(onDisk.mtimeMs);
+            expect(s.mtime.getTime()).toBe(Math.trunc(onDisk.mtimeMs));
+            expect({ ...s }.size).toBe(onDisk.size);
+            // A second stat of the same entry reuses what the first one learned.
+            expect((await statFn(memPathOf(rel))).size).toBe(onDisk.size);
+
+            expect(statted().slice(before)).toEqual([path.join(realDir, rel)]);
         }
+        const inMemory = memGit.vol.toJSON() as Record<string, string | null>;
+        expect(inMemory[memPathOf(objects[0])]).toBeUndefined();
+    });
 
-        expect(code).toBe('ENOENT');
-        expect(memGit.fs.existsSync(memPath)).toBe(false);
+    it('size of an unread object that vanished from disk throws ENOENT and forgets it', async () => {
+        await memGit.loadFromDisk(realDir);
+        const sync = memGit.fs.statSync(memPathOf(objects[0]));
+        const viaCallback = await statCallback(memGit, memPathOf(objects[1]));
+        await fs.rm(path.join(realDir, objects[0]), { force: true });
+        await fs.rm(path.join(realDir, objects[1]), { force: true });
+
+        for (const [s, rel] of [[sync, objects[0]], [viaCallback, objects[1]]] as const) {
+            let code: string | undefined;
+            try {
+                void s.size;
+            } catch (err) {
+                code = (err as NodeJS.ErrnoException).code;
+            }
+            expect(code).toBe('ENOENT');
+            expect(memGit.fs.existsSync(memPathOf(rel))).toBe(false);
+        }
+    });
+
+    it('add and commit after a load only stat objects they actually read', async () => {
+        await memGit.loadFromDisk(realDir);
+        const statted = spyRealStats();
+        const readSpies = [vi.spyOn(fsSync, 'readFileSync'), vi.spyOn(fsSync.promises, 'readFile')];
+        syncBuiltinESMExports();
+
+        await memGit.writeFile('c.txt', 'ccc\n');
+        await memGit.add('.');
+        await memGit.commit('v3');
+
+        const read = new Set(readSpies.flatMap(s => s.mock.calls.map(([p]) => String(p))));
+        const objectStats = statted().filter(p => LOOSE_OBJECT_RE.test(p));
+        expect(objectStats.filter(p => !read.has(p))).toEqual([]);
+        expect((await memGit.log()).map(c => c.message.trim())).toEqual(['v3', 'v2', 'initial']);
     });
 
     it('reading an unread object still returns its bytes', async () => {
         await memGit.loadFromDisk(realDir);
-        const [rel] = await looseObjects(realDir);
 
-        const fromMemory = memGit.fs.readFileSync(path.posix.join(memGit.dir, rel)) as Buffer;
+        const fromMemory = memGit.fs.readFileSync(memPathOf(objects[0])) as Buffer;
 
-        expect(fromMemory.equals(await fs.readFile(path.join(realDir, rel)))).toBe(true);
+        expect(fromMemory.equals(await fs.readFile(path.join(realDir, objects[0])))).toBe(true);
     });
 });

@@ -428,7 +428,7 @@ await mg.flush('./output-dir');         // or somewhere else
 
 Default `loadFromDisk` reads every working-tree file and the entire `.git/` into memory up front. For repos where you only need a tiny slice — an agent that reads HEAD plus one or two paths, a CI probe that runs `git log` once and exits — that's a lot of pointless I/O.
 
-Pass `{ lazy: true }` to the constructor and `loadFromDisk` only walks the tree to learn what exists (one `stat` per file, no `read`). File bytes are pulled in the first time anything reads them through the wrapped fs — `readFile`, `git.log`, `git.checkout`, etc. Anything you never touch stays on disk.
+Pass `{ lazy: true }` to the constructor and `loadFromDisk` only walks the tree to learn what exists (one `stat` per working-tree file, none for content-addressed git objects, no `read`). File bytes are pulled in the first time anything reads them through the wrapped fs — `readFile`, `git.log`, `git.checkout`, etc. Anything you never touch stays on disk.
 
 ```typescript
 const mg = new MemoryGit('agent', { lazy: true });
@@ -446,6 +446,7 @@ Materialized files participate in the normal disk snapshot, so `flush()` stays i
 - **Operations that iterate the working tree force-materialize everything they visit.** `add('.')`, `status`, `statusMatrix` walk every tracked file. If your workflow ends with one of those, lazy doesn't help you. Lazy shines on random-access reads.
 - **`flush({ force: true })` does not refault.** A force-flush rewrites only what's currently in memory — lazy files stay where they are on disk. If you need a true bit-for-bit rewrite of the destination, don't use lazy mode.
 - **External mutation between load and read.** Lazy holds onto the `realPath` it captured at load time. If something else deletes or replaces that file on disk before you fault it in, the read surfaces `ENOENT`. Call `loadFromDisk()` again to reconcile.
+- **Unread git objects have no size until asked.** Loose objects and pack files are content-addressed, so the walk records them without a `stat` — they're most of the files in a repo that commits often, and each `stat` is a round trip on a network filesystem. `stat`/`lstat` of a still-lazy object answers type checks (`isFile()`, `exists`) from the index; reading `size` or a timestamp stats the file on disk once, synchronously, and throws `ENOENT` (dropping the entry) if it has vanished.
 
 Lazy and `tracksDiskSnapshot` compose: the wrapper feeds the snapshot a fingerprint for each file as it materializes, so the next `flush({ clean: true })` only writes what actually changed.
 
