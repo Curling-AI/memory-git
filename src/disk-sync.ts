@@ -579,7 +579,7 @@ export async function indexDiskLazy(
     memoryPath: string,
     matcher: Matcher,
     relPath: string,
-    addFile: (memPath: string, realPath: string, size: number, mtimeMs: number) => void,
+    addFile: (memPath: string, realPath: string, size?: number, mtimeMs?: number) => void,
 ): Promise<number> {
     const entries = await fsRealAsync.readdir(realPath, { withFileTypes: true });
 
@@ -606,6 +606,14 @@ export async function indexDiskLazy(
             return await indexDiskLazy(fs, realEntryPath, memoryEntryPath, matcher, entryRel, addFile);
         }
         if (entry.isFile()) {
+            // A content-addressed object never changes once written, so its
+            // stat is deferred to the first caller that asks for one (reads
+            // re-stat anyway). Loose objects are most of a busy repo's files,
+            // and every stat is a round trip on a network filesystem.
+            if (isImmutableObjectPath(entryRel)) {
+                addFile(memoryEntryPath, realEntryPath);
+                return 1;
+            }
             const stat = await fsRealAsync.stat(realEntryPath);
             addFile(memoryEntryPath, realEntryPath, stat.size, stat.mtimeMs);
             return 1;

@@ -18,7 +18,7 @@
  * regular files participate in the lazy index.
  */
 
-import { promises as fsRealAsync, readFileSync as fsRealReadFileSync, statSync as fsRealStatSync } from 'fs';
+import { promises as fsRealAsync, readFileSync as fsRealReadFileSync, statSync as fsRealStatSync, type Stats } from 'fs';
 import pathNode from 'path';
 import type { createFsFromVolume } from 'memfs';
 import { hashBuffer } from './disk-sync.js';
@@ -30,10 +30,13 @@ type MemFs = ReturnType<typeof createFsFromVolume>;
 export interface LazyFileEntry {
     /** Absolute path on the real filesystem. */
     realPath: string;
-    /** Size in bytes (from stat at index time). */
-    size: number;
-    /** Disk mtime in ms (from stat at index time). */
-    mtimeMs: number;
+    /**
+     * Size in bytes, from stat at index time. Undefined for entries indexed
+     * without a stat (content-addressed git objects) until the first stat.
+     */
+    size?: number;
+    /** Disk mtime in ms. Same lifecycle as `size`. */
+    mtimeMs?: number;
 }
 
 /**
@@ -224,7 +227,7 @@ export function wrapLazyFs(
         memfs.mkdirSync(pathNode.posix.dirname(memPath), { recursive: true });
         memfs.writeFileSync(memPath, content);
         state.forgetFile(memPath);
-        onMaterialize(memPath, content.length, mtimeMs, hashBuffer(content));
+        onMaterialize(memPath, content.length, mtimeMs ?? 0, hashBuffer(content));
         return content;
     };
 
@@ -249,8 +252,47 @@ export function wrapLazyFs(
         memfs.mkdirSync(pathNode.posix.dirname(memPath), { recursive: true });
         memfs.writeFileSync(memPath, content);
         state.forgetFile(memPath);
-        onMaterialize(memPath, content.length, mtimeMs, hashBuffer(content));
+        onMaterialize(memPath, content.length, mtimeMs ?? 0, hashBuffer(content));
         return content;
+    };
+
+    // Entries indexed without a stat (see indexDiskLazy) learn their size and
+    // mtime on the first stat request. A file gone from disk by then is
+    // forgotten and surfaces ENOENT, like a failed read.
+    const statsOf = (memPath: string, entry: LazyFileEntry): LazyFileStats => {
+        if (entry.size === undefined || entry.mtimeMs === undefined) {
+            let real: Stats;
+            try {
+                real = fsRealStatSync(entry.realPath);
+            } catch (err) {
+                if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+                    state.forgetFile(memPath);
+                    throw makeEnoent(memPath);
+                }
+                throw err;
+            }
+            entry.size = real.size;
+            entry.mtimeMs = real.mtimeMs;
+        }
+        return new LazyFileStats(entry.size, entry.mtimeMs);
+    };
+
+    const statsOfAsync = async (memPath: string, entry: LazyFileEntry): Promise<LazyFileStats> => {
+        if (entry.size === undefined || entry.mtimeMs === undefined) {
+            let real: Stats;
+            try {
+                real = await fsRealAsync.stat(entry.realPath);
+            } catch (err) {
+                if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+                    state.forgetFile(memPath);
+                    throw makeEnoent(memPath);
+                }
+                throw err;
+            }
+            entry.size = real.size;
+            entry.mtimeMs = real.mtimeMs;
+        }
+        return new LazyFileStats(entry.size, entry.mtimeMs);
     };
 
     // ---------- sync overrides ----------
@@ -271,7 +313,7 @@ export function wrapLazyFs(
         const memPath = normalize(p);
         if (state.tombstones.has(memPath)) throw makeEnoent(memPath);
         const entry = state.files.get(memPath);
-        if (entry) return new LazyFileStats(entry.size, entry.mtimeMs);
+        if (entry) return statsOf(memPath, entry);
         return memfs.statSync(p, opts);
     };
 
@@ -279,7 +321,7 @@ export function wrapLazyFs(
         const memPath = normalize(p);
         if (state.tombstones.has(memPath)) throw makeEnoent(memPath);
         const entry = state.files.get(memPath);
-        if (entry) return new LazyFileStats(entry.size, entry.mtimeMs);
+        if (entry) return statsOf(memPath, entry);
         return memfs.lstatSync(p, opts);
     };
 
@@ -378,7 +420,10 @@ export function wrapLazyFs(
         const memPath = normalize(p);
         if (state.tombstones.has(memPath)) return queueMicrotask(() => cb(makeEnoent(memPath)));
         const entry = state.files.get(memPath);
-        if (entry) return queueMicrotask(() => cb(null, new LazyFileStats(entry.size, entry.mtimeMs)));
+        if (entry) {
+            statsOfAsync(memPath, entry).then((st) => cb(null, st), cb);
+            return;
+        }
         (memfs as any).stat(p, opts, cb);
     };
 
@@ -387,7 +432,10 @@ export function wrapLazyFs(
         const memPath = normalize(p);
         if (state.tombstones.has(memPath)) return queueMicrotask(() => cb(makeEnoent(memPath)));
         const entry = state.files.get(memPath);
-        if (entry) return queueMicrotask(() => cb(null, new LazyFileStats(entry.size, entry.mtimeMs)));
+        if (entry) {
+            statsOfAsync(memPath, entry).then((st) => cb(null, st), cb);
+            return;
+        }
         (memfs as any).lstat(p, opts, cb);
     };
 
@@ -457,14 +505,14 @@ export function wrapLazyFs(
             const memPath = normalize(p);
             if (state.tombstones.has(memPath)) throw makeEnoent(memPath);
             const entry = state.files.get(memPath);
-            if (entry) return new LazyFileStats(entry.size, entry.mtimeMs);
+            if (entry) return statsOfAsync(memPath, entry);
             return (memfs.promises as any).stat(p, opts);
         },
         lstat: async (p: any, opts?: any) => {
             const memPath = normalize(p);
             if (state.tombstones.has(memPath)) throw makeEnoent(memPath);
             const entry = state.files.get(memPath);
-            if (entry) return new LazyFileStats(entry.size, entry.mtimeMs);
+            if (entry) return statsOfAsync(memPath, entry);
             return (memfs.promises as any).lstat(p, opts);
         },
         readdir: async (p: any, opts?: any) => {
