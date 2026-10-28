@@ -1,6 +1,6 @@
 {
   "name": "memory-git",
-  "version": "3.17.3",
+  "version": "3.17.4",
   "description": "In-memory Git for AI agents, slow filesystems (EFS/NFS), and test harnesses. Bash-like exec() dispatcher, no subprocess, isolated per-instance volumes, .gitignore-aware loading, explicit flush.",
   "main": "dist/index.js",
   "exports": {
