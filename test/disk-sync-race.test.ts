@@ -26,6 +26,7 @@ import {
     copyDiskToMemoryIncremental,
     copyMemoryToDisk,
     copyMemoryToDiskIncremental,
+    indexDiskLazy,
     listFilesRecursive,
     type FileFingerprint,
 } from '../src/disk-sync';
@@ -135,6 +136,52 @@ describe('disk-sync race resilience (unit)', () => {
         expect(result.read).toBe(1); // subA/a.txt only
         expect(seen.has('subA/a.txt')).toBe(true);
         expect(seen.has('subB/b.txt')).toBe(false);
+    });
+
+    it('indexDiskLazy: a loose ref pruned between readdir and stat is left out', async () => {
+        const tags = path.join(tmp, '.git', 'refs', 'tags');
+        await fsRealAsync.mkdir(tags, { recursive: true });
+        for (let i = 0; i < 5; i++) await fsRealAsync.writeFile(path.join(tags, `v${i}`), `oid${i}\n`);
+        const fs = createFsFromVolume(new Volume());
+        fs.mkdirSync('/repo', { recursive: true });
+
+        // `git pack-refs` deletes v3 right after our readdir listed it.
+        const realStat = nodeFs.promises.stat.bind(nodeFs.promises);
+        vi.spyOn(nodeFs.promises, 'stat').mockImplementation((async (p: string, ...rest: unknown[]) => {
+            if (typeof p === 'string' && p.endsWith(`${path.sep}v3`)) throw enoent(p);
+            return realStat(p as string, ...(rest as []));
+        }) as typeof nodeFs.promises.stat);
+
+        const indexed: string[] = [];
+        const count = await indexDiskLazy(fs, tmp, '/repo', ignore(), '', (memPath) => indexed.push(memPath));
+
+        expect(count).toBe(4);
+        expect(indexed).not.toContain('/repo/.git/refs/tags/v3');
+        expect(indexed).toContain('/repo/.git/refs/tags/v0');
+    });
+
+    it('indexDiskLazy: a subdir deleted mid-walk indexes as empty, a missing root still throws', async () => {
+        await fsRealAsync.mkdir(path.join(tmp, 'subA'));
+        await fsRealAsync.writeFile(path.join(tmp, 'subA', 'a.txt'), 'a');
+        await fsRealAsync.mkdir(path.join(tmp, 'subB'));
+        await fsRealAsync.writeFile(path.join(tmp, 'subB', 'b.txt'), 'b');
+        const fs = createFsFromVolume(new Volume());
+        fs.mkdirSync('/repo', { recursive: true });
+
+        const realReaddir = nodeFs.promises.readdir.bind(nodeFs.promises);
+        vi.spyOn(nodeFs.promises, 'readdir').mockImplementation((async (p: string, ...rest: unknown[]) => {
+            if (typeof p === 'string' && p.endsWith('subB')) throw enoent(p);
+            return (realReaddir as (...a: unknown[]) => Promise<unknown>)(p, ...rest);
+        }) as typeof nodeFs.promises.readdir);
+
+        const indexed: string[] = [];
+        await expect(
+            indexDiskLazy(fs, tmp, '/repo', ignore(), '', (memPath) => indexed.push(memPath)),
+        ).resolves.toBe(1);
+        expect(indexed).toEqual(['/repo/subA/a.txt']);
+        await expect(
+            indexDiskLazy(fs, path.join(tmp, 'gone'), '/repo', ignore(), '', () => undefined),
+        ).rejects.toMatchObject({ code: 'ENOENT' });
     });
 
     it('copyMemoryToDiskIncremental: drops stale immutable pack from memfs+snapshot when disk-missing', async () => {

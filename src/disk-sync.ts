@@ -581,7 +581,15 @@ export async function indexDiskLazy(
     relPath: string,
     addFile: (memPath: string, realPath: string, size?: number, mtimeMs?: number) => void,
 ): Promise<number> {
-    const entries = await fsRealAsync.readdir(realPath, { withFileTypes: true });
+    let entries: Dirent[];
+    try {
+        entries = await fsRealAsync.readdir(realPath, { withFileTypes: true });
+    } catch (err) {
+        // Subtree vanished between the parent's readdir and ours (see
+        // copyDiskToMemoryIncremental); a missing root is the caller's error.
+        if (relPath && isENOENT(err)) return 0;
+        throw err;
+    }
 
     const promises = entries.map(async (entry) => {
         // Orphan flush temp (rename never happened) — reap + skip; see copyDiskToMemory.
@@ -614,7 +622,13 @@ export async function indexDiskLazy(
                 addFile(memoryEntryPath, realEntryPath);
                 return 1;
             }
-            const stat = await fsRealAsync.stat(realEntryPath);
+            // A concurrent git (pack-refs pruning loose refs, gc) can delete
+            // the file after our readdir: it is simply not there.
+            const stat = await fsRealAsync.stat(realEntryPath).catch((err: unknown) => {
+                if (isENOENT(err)) return undefined;
+                throw err;
+            });
+            if (!stat) return 0;
             addFile(memoryEntryPath, realEntryPath, stat.size, stat.mtimeMs);
             return 1;
         }
