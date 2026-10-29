@@ -136,6 +136,8 @@ describe('disk-sync race resilience (unit)', () => {
         expect(result.read).toBe(1); // subA/a.txt only
         expect(seen.has('subA/a.txt')).toBe(true);
         expect(seen.has('subB/b.txt')).toBe(false);
+        // No memfs dir for a flush to recreate on disk.
+        expect(fs.existsSync('/repo/subB')).toBe(false);
     });
 
     it('indexDiskLazy: a loose ref pruned between readdir and stat is left out', async () => {
@@ -160,7 +162,8 @@ describe('disk-sync race resilience (unit)', () => {
         expect(indexed).toContain('/repo/.git/refs/tags/v0');
     });
 
-    it('indexDiskLazy: a subdir deleted mid-walk indexes as empty, a missing root still throws', async () => {
+    it('indexDiskLazy: a subdir deleted mid-walk leaves no memfs dir, a missing root still throws', async () => {
+        await fsRealAsync.mkdir(path.join(tmp, 'empty'));
         await fsRealAsync.mkdir(path.join(tmp, 'subA'));
         await fsRealAsync.writeFile(path.join(tmp, 'subA', 'a.txt'), 'a');
         await fsRealAsync.mkdir(path.join(tmp, 'subB'));
@@ -179,6 +182,9 @@ describe('disk-sync race resilience (unit)', () => {
             indexDiskLazy(fs, tmp, '/repo', ignore(), '', (memPath) => indexed.push(memPath)),
         ).resolves.toBe(1);
         expect(indexed).toEqual(['/repo/subA/a.txt']);
+        // No memfs dir for a flush to recreate on disk; one that exists stays.
+        expect(fs.existsSync('/repo/subB')).toBe(false);
+        expect(fs.existsSync('/repo/empty')).toBe(true);
         await expect(
             indexDiskLazy(fs, path.join(tmp, 'gone'), '/repo', ignore(), '', () => undefined),
         ).rejects.toMatchObject({ code: 'ENOENT' });

@@ -369,6 +369,8 @@ export async function copyDiskToMemoryIncremental(
         if (isENOENT(err)) return { read: 0, skipped: 0 };
         throw err;
     }
+    // Only once the directory is known to exist; see indexDiskLazy.
+    fs.mkdirSync(memoryPath, { recursive: true });
 
     const results = await Promise.all(entries.map(async (entry) => {
         // Orphan flush temp (rename never happened) — reap + skip; see copyDiskToMemory.
@@ -390,7 +392,6 @@ export async function copyDiskToMemoryIncremental(
 
         try {
             if (entry.isDirectory()) {
-                fs.mkdirSync(memoryEntryPath, { recursive: true });
                 return await copyDiskToMemoryIncremental(
                     fs, realEntryPath, memoryEntryPath, matcher, entryRel, snapshot, seen,
                 );
@@ -581,15 +582,10 @@ export async function indexDiskLazy(
     relPath: string,
     addFile: (memPath: string, realPath: string, size?: number, mtimeMs?: number) => void,
 ): Promise<number> {
-    let entries: Dirent[];
-    try {
-        entries = await fsRealAsync.readdir(realPath, { withFileTypes: true });
-    } catch (err) {
-        // Subtree vanished between the parent's readdir and ours (see
-        // copyDiskToMemoryIncremental); a missing root is the caller's error.
-        if (relPath && isENOENT(err)) return 0;
-        throw err;
-    }
+    const entries = await fsRealAsync.readdir(realPath, { withFileTypes: true });
+    // Only once the directory is known to exist: a flush recreates every memfs
+    // dir on disk, and an empty `.git/rebase-merge` would fake a rebase.
+    fs.mkdirSync(memoryPath, { recursive: true });
 
     const promises = entries.map(async (entry) => {
         // Orphan flush temp (rename never happened) — reap + skip; see copyDiskToMemory.
@@ -609,30 +605,31 @@ export async function indexDiskLazy(
         const realEntryPath = pathNode.join(realPath, entry.name);
         const memoryEntryPath = pathNode.posix.join(memoryPath, entry.name);
 
-        if (entry.isDirectory()) {
-            fs.mkdirSync(memoryEntryPath, { recursive: true });
-            return await indexDiskLazy(fs, realEntryPath, memoryEntryPath, matcher, entryRel, addFile);
-        }
-        if (entry.isFile()) {
-            // A content-addressed object never changes once written, so its
-            // stat is deferred to the first caller that asks for one (reads
-            // re-stat anyway). Loose objects are most of a busy repo's files,
-            // and every stat is a round trip on a network filesystem.
-            if (isImmutableObjectPath(entryRel)) {
-                addFile(memoryEntryPath, realEntryPath);
+        try {
+            if (entry.isDirectory()) {
+                return await indexDiskLazy(fs, realEntryPath, memoryEntryPath, matcher, entryRel, addFile);
+            }
+            if (entry.isFile()) {
+                // A content-addressed object never changes once written, so its
+                // stat is deferred to the first caller that asks for one (reads
+                // re-stat anyway). Loose objects are most of a busy repo's files,
+                // and every stat is a round trip on a network filesystem.
+                if (isImmutableObjectPath(entryRel)) {
+                    addFile(memoryEntryPath, realEntryPath);
+                    return 1;
+                }
+                const stat = await fsRealAsync.stat(realEntryPath);
+                addFile(memoryEntryPath, realEntryPath, stat.size, stat.mtimeMs);
                 return 1;
             }
-            // A concurrent git (pack-refs pruning loose refs, gc) can delete
-            // the file after our readdir: it is simply not there.
-            const stat = await fsRealAsync.stat(realEntryPath).catch((err: unknown) => {
-                if (isENOENT(err)) return undefined;
-                throw err;
-            });
-            if (!stat) return 0;
-            addFile(memoryEntryPath, realEntryPath, stat.size, stat.mtimeMs);
-            return 1;
+            return 0;
+        } catch (err) {
+            // A file or subtree deleted after our readdir (a concurrent git
+            // pruning loose refs, gc) is simply not there; see
+            // copyDiskToMemoryIncremental.
+            if (isENOENT(err)) return 0;
+            throw err;
         }
-        return 0;
     });
 
     const results = await Promise.all(promises);
