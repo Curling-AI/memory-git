@@ -1,0 +1,18 @@
+# Trivy exceptions (PLA-410). Every entry needs a statement; temporary ones need expired_at.
+# Baseline of findings already on main when the scan was added (2026-11-16).
+vulnerabilities:
+  - id: CVE-2026-63395
+    paths:
+      - "pnpm-lock.yaml"
+    statement: "Baseline (PLA-410): isomorphic-git 1.38.5 already on main. Fix: 1.38.6."
+    expired_at: 2026-11-20
+  - id: CVE-2026-102422
+    paths:
+      - "pnpm-lock.yaml"
+    statement: "Baseline (PLA-410): shell-quote 1.8.4 already on main. Fix: 1.11.0."
+    expired_at: 2026-11-20
+  - id: CVE-2026-13311
+    paths:
+      - "pnpm-lock.yaml"
+    statement: "Baseline (PLA-410): shell-quote 1.8.4 already on main. Fix: 1.9.0."
+    expired_at: 2026-11-20
